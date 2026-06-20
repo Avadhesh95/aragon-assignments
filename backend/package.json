@@ -1,0 +1,37 @@
+{
+  "name": "aragon-backend",
+  "version": "1.0.0",
+  "description": "Aragon image upload backend",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.22.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "heic-convert": "^2.1.0",
+    "morgan": "^1.10.0",
+    "multer": "^1.4.5-lts.1",
+    "node-fetch": "^2.7.0",
+    "sharp": "^0.33.5",
+    "uuid": "^10.0.0"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/heic-convert": "^2.1.1",
+    "@types/morgan": "^1.9.9",
+    "@types/multer": "^1.4.11",
+    "@types/node": "^20.14.10",
+    "@types/uuid": "^10.0.0",
+    "prisma": "^5.22.0",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.5.3"
+  }
+}
