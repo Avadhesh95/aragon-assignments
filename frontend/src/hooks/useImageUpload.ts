@@ -65,9 +65,6 @@ export function useImageUpload() {
         const records = response.data;
 
         // Compute resolved IDs OUTSIDE the updater so the updater stays pure.
-        // React Strict Mode double-invokes updaters — any side effect (like
-        // pendingIds.delete) inside would be wiped by the first call, causing
-        // the second (kept) invocation to skip the update entirely.
         const resolvedIds = new Set(
           records
             .filter((r) => pendingIds.has(r.id) && r.status !== 'PROCESSING')
@@ -80,9 +77,10 @@ export function useImageUpload() {
             for (const record of records) {
               if (!resolvedIds.has(record.id)) continue;
               const existing = next.get(record.id);
-              if (!existing) continue;
+              // Fallback to updating or inserting
               next.set(record.id, {
-                ...existing,
+                ...(existing || {}),
+                imageId: record.id,
                 status: record.status,
                 rejectionReason: record.rejectionReason ?? undefined,
                 record,
@@ -97,11 +95,33 @@ export function useImageUpload() {
           }
         }
 
+        // Even if some aren't resolved yet, we should update status in real time if any processing changes status
+        const processingUpdates = records.filter(r => pendingIds.has(r.id));
+        if (processingUpdates.length > 0) {
+          setItems((prev) => {
+            const next = new Map(prev);
+            let changed = false;
+            for (const record of processingUpdates) {
+              const existing = next.get(record.id);
+              if (existing && existing.status !== record.status) {
+                next.set(record.id, {
+                  ...existing,
+                  status: record.status,
+                  rejectionReason: record.rejectionReason ?? undefined,
+                  record,
+                });
+                changed = true;
+              }
+            }
+            return changed ? next : prev;
+          });
+        }
+
         if (pendingIds.size === 0) {
           stopPolling();
         }
-      } catch {
-        // Poll failure is non-fatal
+      } catch (err) {
+        console.error('Polling error:', err);
       }
     };
 
