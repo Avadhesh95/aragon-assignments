@@ -2,7 +2,13 @@ import { useState, useCallback, useRef, useEffect } from 'react';
 import type { UploadItem } from '../types/image';
 import { uploadImages, fetchImages, deleteImage } from '../services/imageApi';
 
-const ALLOWED_MIME_TYPES = new Set(['image/jpeg', 'image/jpg', 'image/png', 'image/heic', 'image/heif']);
+const ALLOWED_MIME_TYPES = new Set([
+  'image/jpeg',
+  'image/jpg',
+  'image/png',
+  'image/heic',
+  'image/heif',
+]);
 const POLL_INTERVAL_MS = 2000;
 
 /**
@@ -13,130 +19,39 @@ const POLL_INTERVAL_MS = 2000;
  * no server-cache invalidation complexity, and no concurrent mutations from other
  * tabs. React hooks provide sufficient state management without introducing
  * unnecessary complexity or bundle overhead.
- *
- * For a production app with multiple pages sharing image state, I'd add
- * React Query for server-state caching and TanStack's mutation APIs.
  */
 export function useImageUpload() {
   const [items, setItems] = useState<Map<string, UploadItem>>(new Map());
-  const pollTimerRef = useRef<number | null>(null);
+  const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const processingIdsRef = useRef<Set<string>>(new Set());
 
-  // ── Helpers ────────────────────────────────────────────────────────────────
-  const updateItem = useCallback((key: string, update: Partial<UploadItem>) => {
-    setItems((prev) => {
-      const next = new Map(prev);
-      const existing = next.get(key) ?? { status: 'UPLOADING' };
-      next.set(key, { ...existing, ...update });
-      return next;
-    });
-  }, []);
-
-  const removeItem = useCallback((key: string) => {
-    setItems((prev) => {
-      const next = new Map(prev);
-      // Revoke object URL to free memory
-      const item = next.get(key);
-      if (item?.previewUrl) URL.revokeObjectURL(item.previewUrl);
-      next.delete(key);
-      return next;
-    });
-    processingIdsRef.current.delete(key);
-  }, []);
 
   // ── Frontend Validation ────────────────────────────────────────────────────
-  const validateFile = (file: File): string | null => {
-    if (!ALLOWED_MIME_TYPES.has(file.type.toLowerCase())) {
-      return `Unsupported format: ${file.type || 'unknown'}. Allowed: JPEG, PNG, HEIC`;
+  const validateFile = useCallback((file: File): string | null => {
+    const mimeOk = ALLOWED_MIME_TYPES.has(file.type.toLowerCase());
+    if (!mimeOk) {
+      // HEIC files often have empty or wrong MIME type in browsers — check extension
+      const ext = file.name.split('.').pop()?.toLowerCase();
+      if (ext !== 'heic' && ext !== 'heif') {
+        return `Unsupported format: ${file.type || file.name.split('.').pop() || 'unknown'}. Allowed: JPEG, PNG, HEIC`;
+      }
     }
     if (file.size > 10 * 1024 * 1024) {
       return 'File too large. Maximum size: 10MB';
     }
     return null;
-  };
-
-  // ── Upload ─────────────────────────────────────────────────────────────────
-  const handleFiles = useCallback(async (files: FileList | File[]) => {
-    const fileArray = Array.from(files);
-    const validFiles: File[] = [];
-    const localKeys: string[] = [];
-
-    // Step 1: Validate each file and create preview entries
-    for (const file of fileArray) {
-      const localKey = `local-${Date.now()}-${Math.random()}`;
-      const previewUrl = URL.createObjectURL(file);
-      const rejectionReason = validateFile(file);
-
-      if (rejectionReason) {
-        setItems((prev) => {
-          const next = new Map(prev);
-          next.set(localKey, {
-            localFile: file,
-            previewUrl,
-            status: 'FRONTEND_REJECTED',
-            rejectionReason,
-          });
-          return next;
-        });
-      } else {
-        setItems((prev) => {
-          const next = new Map(prev);
-          next.set(localKey, {
-            localFile: file,
-            previewUrl,
-            status: 'UPLOADING',
-          });
-          return next;
-        });
-        validFiles.push(file);
-        localKeys.push(localKey);
-      }
-    }
-
-    if (validFiles.length === 0) return;
-
-    // Step 2: Upload valid files together
-    try {
-      const responses = await uploadImages(validFiles);
-
-      // Step 3: Transition local keys → server IDs
-      for (let i = 0; i < responses.length; i++) {
-        const localKey = localKeys[i];
-        const response = responses[i];
-        const localItem = Array.from(items.values())[0]; // grab preview
-
-        setItems((prev) => {
-          const next = new Map(prev);
-          const existing = next.get(localKey) ?? {};
-          // Replace local key with server ID
-          next.delete(localKey);
-          next.set(response.id, {
-            ...existing,
-            imageId: response.id,
-            status: 'PROCESSING',
-          });
-          return next;
-        });
-
-        processingIdsRef.current.add(response.id);
-      }
-
-      void localItem; // suppress unused warning
-      startPolling();
-    } catch {
-      // Mark all uploading items as failed
-      localKeys.forEach((key) => {
-        updateItem(key, {
-          status: 'FRONTEND_REJECTED',
-          rejectionReason: 'Upload failed — please try again',
-        });
-      });
-    }
-  }, [items, updateItem]);
+  }, []);
 
   // ── Polling ────────────────────────────────────────────────────────────────
+  const stopPolling = useCallback(() => {
+    if (pollTimerRef.current) {
+      clearInterval(pollTimerRef.current);
+      pollTimerRef.current = null;
+    }
+  }, []);
+
   const startPolling = useCallback(() => {
-    if (pollTimerRef.current) return; // Already polling
+    if (pollTimerRef.current) return;
 
     const poll = async () => {
       const pendingIds = processingIdsRef.current;
@@ -146,56 +61,158 @@ export function useImageUpload() {
       }
 
       try {
-        const { data: records } = await fetchImages(1, 100);
+        const response = await fetchImages(1, 100);
+        const records = response.data;
 
-        setItems((prev) => {
-          const next = new Map(prev);
+        // Compute resolved IDs OUTSIDE the updater so the updater stays pure.
+        // React Strict Mode double-invokes updaters — any side effect (like
+        // pendingIds.delete) inside would be wiped by the first call, causing
+        // the second (kept) invocation to skip the update entirely.
+        const resolvedIds = new Set(
+          records
+            .filter((r) => pendingIds.has(r.id) && r.status !== 'PROCESSING')
+            .map((r) => r.id)
+        );
 
-          for (const record of records) {
-            if (!pendingIds.has(record.id)) continue;
-
-            const existing = next.get(record.id);
-            if (!existing) continue;
-
-            if (record.status !== 'PROCESSING') {
+        if (resolvedIds.size > 0) {
+          setItems((prev) => {
+            const next = new Map(prev);
+            for (const record of records) {
+              if (!resolvedIds.has(record.id)) continue;
+              const existing = next.get(record.id);
+              if (!existing) continue;
               next.set(record.id, {
                 ...existing,
                 status: record.status,
                 rejectionReason: record.rejectionReason ?? undefined,
                 record,
               });
-              pendingIds.delete(record.id);
             }
-          }
+            return next;
+          });
 
-          return next;
-        });
+          // Mutate the ref AFTER setItems — never inside the updater
+          for (const id of resolvedIds) {
+            pendingIds.delete(id);
+          }
+        }
 
         if (pendingIds.size === 0) {
           stopPolling();
         }
       } catch {
-        // Poll failure is non-fatal — just retry next interval
+        // Poll failure is non-fatal
       }
     };
 
-    pollTimerRef.current = window.setInterval(poll, POLL_INTERVAL_MS);
-    // Run immediately
+    pollTimerRef.current = setInterval(poll, POLL_INTERVAL_MS);
     poll();
-  }, []);
+  }, [stopPolling]);
 
-  const stopPolling = useCallback(() => {
-    if (pollTimerRef.current) {
-      clearInterval(pollTimerRef.current);
-      pollTimerRef.current = null;
-    }
-  }, []);
+  // ── Upload ─────────────────────────────────────────────────────────────────
+  const handleFiles = useCallback(
+    async (files: FileList | File[]) => {
+      const fileArray = Array.from(files);
+
+      // Step 1: Validate ALL files OUTSIDE of setItems (avoid React StrictMode double-call)
+      const validated: Array<{
+        file: File;
+        localKey: string;
+        previewUrl: string;
+        rejectionReason: string | null;
+      }> = [];
+
+      for (const file of fileArray) {
+        const localKey = `local-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        const previewUrl = URL.createObjectURL(file);
+        const rejectionReason = validateFile(file);
+        validated.push({ file, localKey, previewUrl, rejectionReason });
+      }
+
+      const validEntries = validated.filter((v) => v.rejectionReason === null);
+      const rejectedEntries = validated.filter((v) => v.rejectionReason !== null);
+
+      // Step 2: Add all entries to state at once
+      setItems((prev) => {
+        const next = new Map(prev);
+
+        for (const entry of rejectedEntries) {
+          next.set(entry.localKey, {
+            localFile: entry.file,
+            previewUrl: entry.previewUrl,
+            status: 'FRONTEND_REJECTED',
+            rejectionReason: entry.rejectionReason!,
+          });
+        }
+
+        for (const entry of validEntries) {
+          next.set(entry.localKey, {
+            localFile: entry.file,
+            previewUrl: entry.previewUrl,
+            status: 'UPLOADING',
+          });
+        }
+
+        return next;
+      });
+
+      if (validEntries.length === 0) return;
+
+      // Step 3: Upload valid files to server
+      try {
+        const responses = await uploadImages(validEntries.map((e) => e.file));
+
+        // Step 4: Transition local keys → server IDs
+        setItems((prev) => {
+          const next = new Map(prev);
+          for (let i = 0; i < responses.length; i++) {
+            const localKey = validEntries[i].localKey;
+            const response = responses[i];
+            const existing = next.get(localKey);
+
+            if (existing) {
+              next.delete(localKey);
+              next.set(response.id, {
+                ...existing,
+                imageId: response.id,
+                status: 'PROCESSING',
+              });
+              processingIdsRef.current.add(response.id);
+            }
+          }
+          return next;
+        });
+
+        startPolling();
+      } catch (err) {
+        console.error('Upload failed:', err);
+        // Mark all uploading items as failed
+        setItems((prev) => {
+          const next = new Map(prev);
+          for (const entry of validEntries) {
+            const existing = next.get(entry.localKey);
+            if (existing) {
+              next.set(entry.localKey, {
+                ...existing,
+                status: 'FRONTEND_REJECTED',
+                rejectionReason: 'Upload failed — please try again',
+              });
+            }
+          }
+          return next;
+        });
+      }
+    },
+    [validateFile, startPolling]
+  );
 
   // ── Load existing images on mount ──────────────────────────────────────────
   useEffect(() => {
     const loadExisting = async () => {
       try {
-        const { data: records } = await fetchImages(1, 100);
+        const response = await fetchImages(1, 100);
+        const records = response.data;
+
         setItems((prev) => {
           const next = new Map(prev);
           for (const record of records) {
@@ -223,28 +240,47 @@ export function useImageUpload() {
     };
 
     loadExisting();
-
     return () => stopPolling();
   }, [startPolling, stopPolling]);
 
   // ── Delete ─────────────────────────────────────────────────────────────────
-  const handleDelete = useCallback(async (key: string) => {
-    const item = items.get(key);
-    if (item?.imageId) {
-      try {
-        await deleteImage(item.imageId);
-      } catch {
-        // Best-effort delete
+  const handleDelete = useCallback(
+    async (key: string) => {
+      // Read the imageId from state before removing
+      let imageId: string | undefined;
+      setItems((prev) => {
+        const item = prev.get(key);
+        imageId = item?.imageId;
+        const next = new Map(prev);
+        if (item?.previewUrl) URL.revokeObjectURL(item.previewUrl);
+        next.delete(key);
+        return next;
+      });
+      processingIdsRef.current.delete(key);
+
+      if (imageId) {
+        try {
+          await deleteImage(imageId);
+        } catch {
+          // Best-effort
+        }
       }
-    }
-    removeItem(key);
-  }, [items, removeItem]);
+    },
+    []
+  );
 
   // ── Derived state ──────────────────────────────────────────────────────────
-  const allItems = Array.from(items.entries()).map(([key, item]) => ({ key, ...item }));
+  const allItems = Array.from(items.entries()).map(([key, item]) => ({
+    key,
+    ...item,
+  }));
   const accepted = allItems.filter((i) => i.status === 'ACCEPTED');
-  const rejected = allItems.filter((i) => i.status === 'REJECTED' || i.status === 'FRONTEND_REJECTED');
-  const processing = allItems.filter((i) => i.status === 'PROCESSING' || i.status === 'UPLOADING');
+  const rejected = allItems.filter(
+    (i) => i.status === 'REJECTED' || i.status === 'FRONTEND_REJECTED'
+  );
+  const processing = allItems.filter(
+    (i) => i.status === 'PROCESSING' || i.status === 'UPLOADING'
+  );
 
   return {
     allItems,

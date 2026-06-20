@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.env
+uploads/
+*.log
+test_*.jpg
+test_*.png
